@@ -4,7 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nginx ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY nginx/baseline.conf /etc/nginx/baseline.conf
+COPY baseline.conf /etc/nginx/baseline.conf
 RUN sed 's/worker_processes auto;/worker_processes 1;/' \
     /etc/nginx/baseline.conf > /etc/nginx/tuned.conf
 

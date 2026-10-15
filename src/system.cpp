@@ -439,7 +439,7 @@ ExperimentResult experiment(const ExperimentOptions& options) {
         throw std::invalid_argument("cpus must be positive and finite");
     if (!std::regex_match(options.memory, std::regex("[1-9][0-9]*[kKmMgG]?")))
         throw std::invalid_argument("memory must be a positive size such as 256m");
-    for (const auto* path : {"Dockerfile", "nginx/baseline.conf"})
+    for (const auto* path : {"experiments/nginx/Dockerfile", "experiments/nginx/baseline.conf"})
         if (!std::filesystem::is_regular_file(options.project_root / path))
             throw std::runtime_error("Project root is missing " + std::string(path) +
                                      "; use --project-root");
@@ -450,7 +450,8 @@ ExperimentResult experiment(const ExperimentOptions& options) {
         throw std::runtime_error("A local Linux Docker engine is required");
     const auto version = docker({"version", "--format", "{{.Server.Version}}"});
     std::cerr << "Building Ubuntu + Nginx image (first run needs internet)…\n";
-    docker({"build", "--tag", "server-opt-nginx:local", options.project_root.string()}, 900);
+    docker({"build", "--tag", "server-opt-nginx:local",
+            (options.project_root / "experiments/nginx").string()}, 900);
     const auto image = docker({"image", "inspect", "--format", "{{.Id}}", "server-opt-nginx:local"});
     const auto packages = docker({"run", "--rm", "--network", "none", image,
                                   "dpkg-query", "-W", "-f=${Package}=${Version}\n"});
@@ -463,7 +464,7 @@ ExperimentResult experiment(const ExperimentOptions& options) {
         {"docker_server_version", version},
         {"docker_os_description_arch_cpus_memory_cgroup", info},
         {"image_id", image}, {"packages", packages},
-        {"baseline_config", read_file(options.project_root / "nginx/baseline.conf")},
+        {"baseline_config", read_file(options.project_root / "experiments/nginx/baseline.conf")},
         {"settings", Json::Object{
             {"cpus", options.cpus}, {"memory", options.memory},
             {"repeats", options.repeats}, {"duration", options.duration},

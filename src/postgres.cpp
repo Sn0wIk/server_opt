@@ -218,7 +218,7 @@ ExperimentResult postgres_experiment(const PostgresOptions& options) {
         options.repeats < 2 || options.repeats > 10 ||
         options.inserts_per_client < 100 || options.inserts_per_client > 10000)
         throw std::invalid_argument("duration: 3..300; repeats: 2..10; inserts-per-client: 100..10000");
-    const auto directory = options.project_root / "postgres";
+    const auto directory = options.project_root / "experiments/postgres";
     for (const auto* file : {"Dockerfile", "setup.sql", "search.sql", "insert.sql", "verify.sql"})
         if (!std::filesystem::is_regular_file(directory / file))
             throw std::runtime_error("Missing postgres experiment file: " + std::string(file));

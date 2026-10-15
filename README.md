@@ -1,226 +1,100 @@
-# Server Opt — C++17
+# server-opt
 
-Нативный инструмент для проверки ресурсов Linux и воспроизводимых экспериментов
-с Nginx и PostgreSQL. HTTP-генератор, аудит и управление экспериментами написаны
-на C++17. Для SQL-нагрузки используется нативный pgbench. Python не нужен.
+A native C++17 toolkit for finding and *measuring* wasted resources on
+Linux servers: HTTP load generation, container experiments, and a
+`pg_stat_statements` analyzer that ranks real PostgreSQL queries by
+cumulative time and flags anti-patterns.
 
-Проверяем конкретную гипотезу: **при лимите в один CPU один рабочий процесс Nginx
-может расходовать меньше памяти, чем автоматическое число процессов**.
-Выигрыш не гарантируется: он зависит от числа доступных ядер, нагрузки и окружения.
+Every claim in this repo is backed by a reproducible measurement —
+including negative results.
 
-Эксперимент Nginx и ограничения выводов: [BENCHMARK.md](BENCHMARK.md).
-Эксперимент PostgreSQL: [методика и запуск](postgres/README.md).
-Результат на миллионе товаров: [POSTGRES_BENCHMARK.md](POSTGRES_BENCHMARK.md).
+## What it does
 
-## Сборка
+| Command | Purpose |
+|---|---|
+| `server-opt audit` | Read-only snapshot of Linux resources (RAM, cgroup limits, top processes) |
+| `server-opt bench URL` | HTTP load via libcurl multi; throughput, latency percentiles, error classes |
+| `server-opt experiment` | Controlled Nginx A/B: `worker_processes auto` vs `1` under a 1-CPU container |
+| `server-opt postgres` | Disposable PostgreSQL benchmark: index vs no-index with measured costs |
+| `server-opt analyze` | Reads `pg_stat_statements` of a running PG container; flags TRUNCATE churn, schema introspection, implicit joins, `LIKE` patterns |
 
-Нужны компилятор C++17, Make и libcurl 7.85+ с заголовочными файлами.
-На macOS используются Command Line Tools и системная libcurl:
+## Measured case studies
+
+| Case | Setup | Result |
+|---|---|---|
+| [Nginx worker count](experiments/nginx/RESULTS.md) | 1 CPU container, 32 connections, 6 runs | −40.9% container RAM (4.85 → 2.87 MiB); throughput change within noise |
+| [Index benchmark](experiments/postgres/RESULTS.md) | 1M-row catalog, range+sort query | ~×299 read throughput; −3.4% insert throughput; +58% storage |
+| [Wiki.js](experiments/wikijs/FINDINGS.md) | Real app, 150 pages via API | Finding is architectural: `TRUNCATE pageTree` + full rebuild per page create — not an index problem |
+| [Zabbix at 100M rows](experiments/zabbix/FINDINGS.md) | `history` table, 30-day retention cleanup | `DROP PARTITION` vs housekeeper `DELETE`: ~74 s heavy work → ~3 s; reads 3× faster (57 vs 182 ms p50); disk actually freed |
+
+**Honest scope:** these results are specific to the measured workload, schema
+and hardware. They do not generalize to every server — that's why the tool
+measures instead of guessing.
+
+## Build
+
+Requires a C++17 compiler, Make, and libcurl ≥ 7.85 with headers.
 
 ```sh
-make
-make test
-./build/server-opt --help
+make          # → build/server-opt
+make test     # 18 native tests
+make sanitize # ASan/UBSan build, then: make clean && make
 ```
 
-На Ubuntu 24.04 установи зависимости, затем выполни те же команды:
+Ubuntu:
 
 ```sh
-sudo apt-get update
 sudo apt-get install build-essential libcurl4-openssl-dev
 ```
 
-`make sanitize` пересобирает программу и тесты с AddressSanitizer и UBSan.
-После проверки: `make clean && make`, чтобы вернуть обычную сборку с `-O2`.
-
-## Аудит
+## Usage
 
 ```sh
+# Snapshot of the machine
 ./build/server-opt audit --output results/audit.json
+
+# Load test (your own service only)
+./build/server-opt bench http://127.0.0.1:8080/health --duration 30 --concurrency 8
+
+# Nginx experiment — needs Docker with Linux containers
+./build/server-opt experiment --duration 15 --repeats 3
+
+# PostgreSQL index benchmark — disposable container, ~1M rows
+./build/server-opt postgres --rows 1000000
+
+# Analyze a live PostgreSQL container (read-only)
+./build/server-opt analyze --container zbx-db --database zabbix --user zabbix --top 15
 ```
 
-На Linux собираются RAM, swap, load average, PSI, видимые лимиты cgroup v2,
-15 крупнейших процессов по RSS и работающие systemd-службы, если доступны.
-Аудит ничего не отключает и не меняет настройки ОС.
-Аргументы процессов и переменные окружения не собираются.
+`analyze` requires `pg_stat_statements` enabled in the target database:
 
-RSS содержит общие страницы: складывать RSS процессов как фактическую RAM нельзя.
-В контейнере `/proc/meminfo` может показывать память хоста, а видимый корень cgroup —
-не cgroup текущего процесса. Эти ограничения отмечены в отчёте.
-
-На macOS доступен частичный снимок хоста: CPU, load average, файловая система.
-Он не выдаётся за измерение Ubuntu.
-
-## HTTP-нагрузка
-
-```sh
-./build/server-opt bench http://127.0.0.1:8080/health \
-  --duration 30 --concurrency 8 --output results/bench.json
+```sql
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';  -- then restart
+CREATE EXTENSION pg_stat_statements;
 ```
 
-Генератор использует **libcurl multi**: один цикл обработки множества соединений,
-HTTP/1.1 keep-alive, без отдельного потока на каждый запрос.
-Поддерживаются HTTP и HTTPS с проверкой TLS-сертификата.
-Соединения прямые: переменные proxy игнорируются.
+## Methodology rules we follow
 
-По умолчанию успешен HTTP 200. Параметры:
+- Optimizations are verified on disposable copies, never claimed blind.
+- Write-side costs (insert rate, storage) are measured alongside wins.
+- `measurement_valid` in reports excludes runs with load or collection errors.
+- Memory savings ≠ energy savings: kWh requires separate measurement.
+- A bigger relative win on a tiny number is still a tiny number — absolute
+  values are always reported.
 
-| Флаг | Назначение |
-|---|---|
-| `--duration 30` | Время отправки новых запросов в секундах |
-| `--concurrency 8` | Одновременные запросы, от 1 до 256 |
-| `--timeout 3` | Максимальная продолжительность одного запроса |
-| `--expected-status 200` | Требуемый HTTP-статус |
-| `--expect-body FILE` | Побайтовое сравнение ответа с файлом, включая переводы строк |
-| `--output FILE` | Сохранение JSON; каталог должен существовать |
+## Layout
 
-Ответ больше 1 MiB отклоняется; редиректы не выполняются.
-Нагрузку направляй на свой тестовый сервис. URL сохраняется в отчёте:
-не помещай в него секреты.
-
-Отчёт содержит успешные запросы/с, ошибки по причинам, HTTP-статусы,
-p50/p95/p99 успешных запросов, число байтов и CPU-время процесса генератора.
-Ошибка HTTP или неправильное тело не увеличивают полезную пропускную способность.
-Время теста включает завершение уже отправленных запросов.
-
-Метрики задержек считают всё время передачи, включая установление новых соединений.
-Перцентили для длинных прогонов используют равномерную выборку до 100 000 запросов;
-счётчики и среднее учитывают все запросы. Это closed-loop тест с постоянной
-конкурентностью, а не модель фиксированного потока запросов и не проверка SLA.
-
-Даже нативный генератор может ограничивать результат. Перед заявлениями о предельной
-производительности используй отдельный хост и независимый генератор нагрузки.
-
-## Эксперимент Ubuntu + Nginx
-
-Нужен работающий **локальный Docker с Linux-контейнерами**:
-Docker Engine на Ubuntu либо Docker Desktop на Mac.
-Первый запуск требует интернет для загрузки Ubuntu и пакетов.
-
-Из корня проекта:
-
-```sh
-./build/server-opt experiment
+```
+src/                 C++17 sources (benchmark, audit, experiments, analyzer)
+tests/               native test suite with a local HTTP rig
+experiments/
+  nginx/             worker_processes A/B: Dockerfile, configs, results
+  postgres/          disposable index benchmark: SQL rig, results
+  wikijs/            Wiki.js deployment script + analysis findings
+  zabbix/            100M-row history partitioning experiment + findings
 ```
 
-Команда соберёт образ, выполнит по три замера каждого профиля с прогревом
-и сохранит `results/experiment.json`. Порядок профилей чередуется между раундами.
-По умолчанию замер длится 15 секунд; полный прогон дольше 90 секунд с учётом
-сборки, прогрева и сбора метрик.
+## License
 
-Короткая проверка запуска, не доказательство выигрыша:
-
-```sh
-./build/server-opt experiment --duration 3 --repeats 1 \
-  --output results/experiment-smoke.json
-```
-
-Доступны `--cpus`, `--memory`, `--duration`, `--concurrency`, `--repeats`,
-`--project-root` и `--output`. Для запуска из другого каталога укажи путь к проекту:
-
-```sh
-/path/to/server_opt/build/server-opt experiment --project-root /path/to/server_opt
-```
-
-| Параметр | baseline | tuned |
-|---|---|---|
-| ОС и пакеты | Один образ Ubuntu 24.04 | Тот же образ |
-| `worker_processes` | `auto` | `1` |
-| CPU quota по умолчанию | 1 CPU | 1 CPU |
-| Лимит RAM по умолчанию | 256 MiB | 256 MiB |
-| Ответ | Небольшой JSON | Тот же JSON |
-| Логи доступа | Отключены | Отключены |
-| Прогрев | 1 секунда | 1 секунда |
-| Проверка ответа | HTTP 200 + точное тело | Та же проверка |
-
-Оба профиля получают одну конфигурацию; меняется только `worker_processes`.
-Это описанный baseline эксперимента, а не все настройки произвольного сервера Ubuntu.
-`auto` может видеть больше CPU, чем разрешает quota. Количество процессов
-сохраняется в отчёте. Если он запускает один worker, профили не отличаются.
-При нескольких CPU один worker может ухудшить результат.
-
-В JSON сохраняются ID образа, версии пакетов, конфигурация, окружение,
-сырые метрики Docker и каждый замер. Теги Ubuntu и apt-пакеты обновляются:
-для точного повторения сохрани конкретный образ через `docker image save`.
-
-Контейнеры работают по очереди, с ограничением CPU/RAM, от непривилегированного
-пользователя, без дополнительных capabilities, с read-only файловой системой
-и временным `/tmp`. Порт публикуется на `127.0.0.1` со случайным номером.
-После замера контейнер удаляется; образ `server-opt-nginx:local` и кеш сборки остаются.
-
-После Ctrl+C выполняется очистка. После принудительного убийства процесса
-контейнер может остаться. Посмотреть контейнеры эксперимента:
-
-```sh
-docker ps -a --filter label=app=server-opt-experiment
-```
-
-Удалить конкретный: `docker rm -f ИМЯ_КОНТЕЙНЕРА`.
-Удалить образ: `docker image rm server-opt-nginx:local`.
-Программа не выполняет очистку ресурсов других проектов.
-
-Уже завершённые замеры сохраняются после каждого профиля.
-У неполного отчёта нет раздела `summary`. Прогресс идёт в stderr, JSON — в stdout.
-
-## Анализ работающей PostgreSQL (read-only)
-
-Читает `pg_stat_statements` из запущенного контейнера PostgreSQL и ранжирует
-запросы по суммарному времени. Помечает паттерны: повторные TRUNCATE/DDL под
-нагрузкой, интроспекцию схемы (`information_schema`/`pg_catalog`), частые дешёвые
-запросы и `LIKE`-паттерны:
-
-```sh
-./build/server-opt analyze --container wiki-db --database wiki --user wikijs --top 12
-```
-
-Требует включённого `pg_stat_statements` в целевой базе; команда сама ничего
-не меняет. Результат на реальном развёртывании Wiki.js: [wiki/FINDINGS.md](wiki/FINDINGS.md).
-
-Кейс Zabbix (100M строк в `history`): housekeeper-`DELETE` против партиций —
-измерено ~25× меньше тяжёлой работы на очистку и ~3× быстрее чтения.
-Отчёт и скрипты: [zabbix/FINDINGS.md](zabbix/FINDINGS.md).
-
-## Интерпретация
-
-В `summary`:
-
-- `median_load_memory_bytes`: медиана памяти по замерам.
-- `median_successful_requests_per_second`: медианная полезная пропускная способность.
-- `median_p95_ms`: медиана p95 отдельных прогонов, не объединённый p95.
-- `failed_requests`: сумма ошибок.
-- `memory_reduction_percent`: положительное значение означает меньший расход RAM.
-- `throughput_change_percent`: положительное значение означает больше успешных запросов.
-- `measurement_valid`: есть успешные запросы и метрики, нет ошибок нагрузки/сбора,
-  контейнеры живы и не убиты OOM. Это техническая проверка, не статистическая значимость.
-
-Сначала проверяй ошибки и задержки, затем память и скорость. Профиль не становится
-лучше, если экономия RAM нарушает требования приложения. Нулевой и отрицательный
-результаты тоже сохраняются.
-
-Память из `docker stats` исключает часть кеша и округлена при отображении.
-Максимум среди выборок не равен фактическому пику.
-Сбор метрик тоже расходует ресурсы и одинаков для обоих профилей.
-На Mac Docker работает в Linux VM — это не измерение физического сервера Ubuntu.
-
-**Энергия не измеряется.** Меньше RAM или больше запросов/с не доказывают снижение
-кВт·ч. Для этого нужны измерения энергии на одинаковую полезную работу.
-Здесь маленький готовый ответ без TLS, приложения и базы. Следующий эксперимент —
-реальное приложение с заданными требованиями к задержкам и ошибкам.
-
-Коды выхода: `0` — успешное выполнение, `1` — ошибка запуска/параметров,
-`2` — ошибки нагрузки или невалидные измерения, `130` — прерывание.
-
-## Структура
-
-- `./build/server-opt postgres` — отдельный эксперимент с поиском товаров в PostgreSQL;
-  методика и запуск описаны в [postgres/README.md](postgres/README.md).
-- `src/benchmark.cpp` — нагрузочный генератор на libcurl multi.
-- `src/system.cpp` — аудит, запуск Docker без shell, сбор и сохранение результатов.
-- `src/main.cpp` — CLI.
-- `src/json.hpp` — небольшой JSON writer; внешние JSON не разбирает.
-- `tests/test_server_opt.cpp` — нативные тесты с локальным HTTP-стендом.
-- `nginx/baseline.conf`, `Dockerfile` — сервер эксперимента.
-
-Перед публикацией проверь JSON: в нём могут быть имена служб/процессов и URL.
-Выбери лицензию для собственного кода; лицензии зависимостей действуют отдельно.
-Заявлений об экономии без опубликованных измерений в проекте нет.
+MIT. Dependencies (libcurl, nginx, PostgreSQL, and the measured apps) keep
+their own licenses.
